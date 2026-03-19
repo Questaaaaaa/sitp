@@ -1,3 +1,4 @@
+source ~/pybullet_env/bin/activate
 import pybullet as p
 import pybullet_data
 import time
