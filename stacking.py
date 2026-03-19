@@ -1,0 +1,178 @@
+import pybullet as p
+import pybullet_data
+import time
+import random
+import numpy as np
+
+class FinalFixedPandaTask:
+    def __init__(self):
+        # 1. 初始化场景
+        p.connect(p.GUI)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.8)
+        p.setPhysicsEngineParameter(numSolverIterations=300, fixedTimeStep=1./240.)
+        
+        # 🟢 视角：保持你喜欢的侧向 45 度
+        p.resetDebugVisualizerCamera(1.5, 50, -35, [0.3, 0, 0.2])
+        
+        self.plane_id = p.loadURDF("plane.urdf")
+        self.robot_id = p.loadURDF("franka_panda/panda.urdf", [0, 0, 0], useFixedBase=True)
+        
+        self.ee_link_id = 11
+        self.arm_joints = [0, 1, 2, 3, 4, 5, 6]
+        self.gripper_joints = [9, 10]
+        
+        # 强行扩大指爪行程 (12cm)
+        for j in self.gripper_joints:
+            p.changeDynamics(self.robot_id, j, jointLowerLimit=0.0, jointUpperLimit=0.06)
+
+        self.box_half_size = 0.035
+        self.gripper_open = 0.058
+        self.gripper_grasp = 0.030
+        
+        # 🟢 关键修正 1：偏移归零！
+        # 因为 Link 11 本身就是爪子中心，不需要抬高了
+        self.z_offset = 0.0 
+        
+        self.source_pos = [0.5, 0.0]  
+        self.target_pos = [0.4, 0.4]
+
+        # 初始姿态
+        self.rest_poses = [0, -0.4, 0, -2.5, 0, 2.2, 0.8, 0, 0, 0.04, 0.04]
+        for i, pose in enumerate(self.rest_poses):
+            if i < p.getNumJoints(self.robot_id):
+                p.resetJointState(self.robot_id, i, pose)
+        
+        self.boxes = self.spawn_boxes(3)
+        
+        print("⏳ 等待环境完全静止...")
+        for _ in range(150): p.stepSimulation()
+
+    def spawn_boxes(self, num):
+        objs = []
+        for i in range(num):
+            # 🟢 1. 随机生成 X 和 Y 坐标
+            # X轴 (前后): 0.35 到 0.6 米 (机械臂舒适工作区)
+            # Y轴 (左右): -0.2 到 0.2 米 (太远了机械臂够不着)
+            rand_x = random.uniform(0.35, 0.6)
+            rand_y = random.uniform(-0.2, 0.2)
+            
+            # 🟢 2. 随机生成角度 (偏航角 Yaw)
+            # 让箱子稍微歪一点，增加真实感 (-30度 到 30度)
+            rand_yaw = random.uniform(-0.5, 0.5)
+            orn = p.getQuaternionFromEuler([0, 0, rand_yaw])
+
+            # Z轴: 为了防止箱子生成时重叠在一起爆炸，我们还是给它们一点高度差
+            # 它们生成后会掉下来落在桌子上
+            z_pos = self.box_half_size + i * 0.1 
+
+            print(f"🎲 生成箱子 {i} -> 位置: [{rand_x:.2f}, {rand_y:.2f}]")
+
+            # 创建物理属性
+            vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[self.box_half_size]*3, rgbaColor=[1, 1, 1, 1])
+            col_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=[self.box_half_size]*3)
+            
+            # 🟢 3. 传入随机位置和随机角度
+            box_id = p.createMultiBody(0.5, col_id, vis_id, [rand_x, rand_y, z_pos], orn)
+            texture_id = p.loadTexture("textures/box.png")
+            p.changeVisualShape(box_id, -1, textureUniqueId=texture_id)            
+            # 增加摩擦力，防止箱子掉下来滑太远
+            p.changeDynamics(box_id, -1, lateralFriction=0.5, spinningFriction=0.5, rollingFriction=0.5)
+            
+            objs.append(box_id)
+        
+        return objs
+
+    def move_robot(self, target_pos, grip_val, max_steps=400, threshold=0.005):
+        """
+        一个通用的移动函数
+        """
+        real_target = [target_pos[0], target_pos[1], target_pos[2] + self.z_offset]
+        orn = p.getQuaternionFromEuler([0, np.pi, np.pi/2])
+        
+        for step in range(max_steps):
+            ee_state = p.getLinkState(self.robot_id, self.ee_link_id)
+            dist = np.linalg.norm(np.array(ee_state[0]) - np.array(real_target))
+            
+            # 如果到达目标附近 (误差 < 5mm)，且至少运行了 30 步，就提前结束
+            if dist < threshold and step > 30: 
+                break
+                
+            joint_poses = p.calculateInverseKinematics(self.robot_id, self.ee_link_id, real_target, orn)
+            
+            # 加大一点力道 force=500
+            for i in range(7):
+                p.setJointMotorControl2(self.robot_id, i, p.POSITION_CONTROL, joint_poses[i], force=500)
+            for j in self.gripper_joints:
+                p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL, grip_val, force=200)
+            
+            p.stepSimulation()
+            time.sleep(1./480.)
+
+    def run(self):
+        safe_h = 0.55
+        
+        for i in range(len(self.boxes)-1, -1, -1):
+            box = self.boxes[i]
+            
+            # 1. 移动到上方
+            pos, _ = p.getBasePositionAndOrientation(box)
+            print(f"📦 正在搬运第 {3-i} 个箱子 (Z={pos[2]:.3f})")
+            self.move_robot([pos[0], pos[1], safe_h], self.gripper_open)
+            
+            # 🟢 关键修正 2：垂直下降抓取
+            # 这里我们手动把 max_steps 设得非常大 (800)，确保它一定能沉到底
+            # 同时再次刷新坐标
+            pos, _ = p.getBasePositionAndOrientation(box)
+            print("    ↓ 正在下潜...")
+            self.move_robot([pos[0], pos[1], pos[2]], self.gripper_open, max_steps=800)
+            
+            # 停顿确认
+            for _ in range(50): p.stepSimulation()
+            
+            # 3. 抓取
+            print("    🦀 闭合指爪")
+            pos, _ = p.getBasePositionAndOrientation(box)
+            # 原地闭合，不需要移动，给够时间让指爪关紧
+            for _ in range(100):
+                self.move_robot([pos[0], pos[1], pos[2]], self.gripper_grasp, max_steps=1)
+            
+            # 4. 提起
+            print("    ↑ 提起")
+            lift_steps = 700
+            for s in range(lift_steps):
+                z = pos[2] + (safe_h - pos[2]) * (s/lift_steps)
+                self.move_robot([pos[0], pos[1], z], self.gripper_grasp, max_steps=1)
+
+            # 5. 搬运
+            self.move_robot([self.target_pos[0], self.target_pos[1], safe_h], self.gripper_grasp, max_steps=300)
+            
+            # 6. 精确堆叠
+            stack_z = self.box_half_size + (2-i) * (self.box_half_size*2)
+            print(f"    ↓ 放置高度: {stack_z:.3f}")
+            
+            # 稍微悬停在目标上方 5cm
+            self.move_robot([self.target_pos[0], self.target_pos[1], stack_z + 0.05], self.gripper_grasp, max_steps=150)
+            # 缓慢压实
+            self.move_robot([self.target_pos[0], self.target_pos[1], stack_z + 0.005], self.gripper_grasp, max_steps=150)
+            
+            # 7. 释放
+            self.move_robot([self.target_pos[0], self.target_pos[1], stack_z + 0.005], self.gripper_open, max_steps=80)
+            
+# --- 8. 🟢 新增：原地上升 (垂直抽离) ---
+            # 逻辑：保持当前放置点的 X, Y 不变，强制 Z 轴上升到安全高度
+            # 这样可以确保指爪完全脱离箱子区域后，再进行横向大动作
+            print("    ↑ 垂直抽离，防止带倒箱子")
+            retract_h = stack_z + 0.15  # 向上提 15 厘米
+            self.move_robot([self.target_pos[0], self.target_pos[1], retract_h], self.gripper_open, max_steps=150)
+            
+            # --- 9. 返回起始高度 ---
+            self.move_robot([self.target_pos[0], self.target_pos[1], safe_h], self.gripper_open, max_steps=100)
+        print("✨ 任务圆满完成！")
+        while True:
+            p.stepSimulation()
+            time.sleep(0.01)
+
+if __name__ == "__main__":
+    task = FinalFixedPandaTask()
+    task.run()
